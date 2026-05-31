@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "mem0-lifecycle"
+version = "0.1.0"
+description = "Mem0 memory enhancement via forgetting curve model"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "HH1162" }
+]
+keywords = ["mem0", "memory", "lifecycle", "forgetting-curve", "exponential-decay"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "mem0ai>=2.0.4",
+    "qdrant-client>=1.4.0",
+    "click>=8.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["black", "ruff"]
+
+[project.scripts]
+mem0-lifecycle = "mem0_lifecycle.cli:main"
+mem0-server = "mem0_lifecycle.server:cli_main"
+
+[tool.setuptools.packages.find]
+include = ["mem0_lifecycle*"]
