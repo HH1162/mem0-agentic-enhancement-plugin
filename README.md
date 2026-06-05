@@ -1,4 +1,4 @@
-# Mem0 Memory Enhancement via Forgetting Curve Model
+# Mem0 Memory Lifecycle — Auto-Cleanup with Ebbinghaus Decay
 
 > A production-tested memory lifecycle system that makes Mem0 behave like human memory — frequently accessed information persists, unused information naturally decays.
 
