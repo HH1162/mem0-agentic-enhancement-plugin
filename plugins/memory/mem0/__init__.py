@@ -51,12 +51,12 @@ def _load_config() -> dict:
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
         "rerank": True,
         "keyword_search": False,
-        # Local mode paths — configure these in mem0.json or env vars
-        "mem0_server": os.environ.get("MEM0_SERVER", ""),
-        "mem0_python": os.environ.get("MEM0_PYTHON", ""),
+        # Local mode paths — local defaults overridden by mem0.json/env vars
+        "mem0_server": os.environ.get("MEM0_SERVER", "/media/data/mem0/mem0_server.py"),
+        "mem0_python": os.environ.get("MEM0_PYTHON", "/media/data/mem0/.venv/bin/python"),
         "llm_base_url": os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1"),
         "llm_model": os.environ.get("LLM_MODEL", "qwen3"),
-        "embedder_model": os.environ.get("EMBEDDER_MODEL", ""),
+        "embedder_model": os.environ.get("EMBEDDER_MODEL", "/home/herocco/bge/bge-large-zh-v1.5"),
         "embedding_dims": int(os.environ.get("EMBEDDING_DIMS", "1024")),
         "qdrant_host": os.environ.get("QDRANT_HOST", "localhost"),
         "qdrant_port": int(os.environ.get("QDRANT_PORT", "6333")),
@@ -197,7 +197,7 @@ class Mem0MemoryProvider(MemoryProvider):
                         'embedder': {
                             'provider': 'huggingface',
                             'config': {
-                                'model': cfg.get("embedder_model", "")
+                                'model': cfg.get("embedder_model", "/home/herocco/bge/bge-large-zh-v1.5")
                             }
                         },
                         'vector_store': {
@@ -230,19 +230,24 @@ class Mem0MemoryProvider(MemoryProvider):
 
     # -- Shared deduplication & formatting -----------------------------------
 
-    def _deduplicate_and_format(self, results, top_k=5):
-        """Deduplicate search results and format with conflict markers.
+    def _advanced_dedup_and_format(self, results, top_k=5, mem0_python=None, mem0_server=None):
+        """Advanced deduplication with dual thresholds, config check, and track freezing.
 
-        Uses embedding cosine similarity when vectors are available (_embedding field).
-        Falls back to exact text dedup (no conflict markers) when vectors are missing.
+        Dual-level conflict detection:
+          > 0.92: high-confidence conflict (⚠️) — only track winner
+          0.75-0.92: possible related (🔗) — both track normally
+          < 0.75: unrelated — normal injection
+        Config-type conflicts (IP/port/version) in 0.75-0.92 are promoted to high-confidence.
 
         Returns (formatted_lines, kept_ids, shadow_ids).
         """
         from datetime import datetime, timezone
         import re
+        import subprocess
+
+        logger.info("[DEDUP] Entry: %d results, top_k=%d", len(results), top_k)
 
         def cosine_similarity(a, b):
-            """Compute cosine similarity between two vectors."""
             dot = sum(x * y for x, y in zip(a, b))
             norm_a = sum(x * x for x in a) ** 0.5
             norm_b = sum(x * x for x in b) ** 0.5
@@ -250,10 +255,10 @@ class Mem0MemoryProvider(MemoryProvider):
                 return 0.0
             return dot / (norm_a * norm_b)
 
-        def is_exact_dup(t1, t2):
-            c1 = re.sub(r'[^\w\s]', '', t1).strip()
-            c2 = re.sub(r'[^\w\s]', '', t2).strip()
-            return c1 == c2
+        def is_exact_duplicate(text1, text2):
+            clean1 = re.sub(r'[^\w\s]', '', text1).strip()
+            clean2 = re.sub(r'[^\w\s]', '', text2).strip()
+            return clean1 == clean2
 
         def freq_label(ac):
             if ac > 20:
@@ -277,63 +282,154 @@ class Mem0MemoryProvider(MemoryProvider):
             ac = (mem.get("metadata") or {}).get("access_count", 0)
             prefix = f"[Updated {days_ago} days ago | {now.strftime('%Y-%m-%d')} | {freq_label(ac)}]"
             if conflict_info:
-                idx, sim = conflict_info
-                note = f" ⚠️ 可能与第{idx}条冲突(相似度{sim:.2f})"
+                target_index, sim, level = conflict_info
+                if level == 'high':
+                    note = f" ⚠️ 可能与第{target_index}条冲突(相似度{sim:.2f})"
+                else:
+                    note = f" 🔗 可能与第{target_index}条相关(相似度{sim:.2f}，可能描述同一事物的不同状态)"
                 return f"- {prefix}{note}：{mem.get('memory', '')}"
             return f"- {prefix} {mem.get('memory', '')}"
 
-        # Check if any result has embedding vectors
         has_vectors = any("_embedding" in r and r["_embedding"] for r in results)
+        logger.info("[DEDUP] has_vectors=%s", has_vectors)
 
         kept = []
         shadow_ids = []
-        conflicts = []
+        conflicts = []  # (mem, conflict_with_mem, similarity, level)
+
+        _EXCLUSIVE_KEYS = {
+            'ip', 'host', 'hostname', 'address', 'url', 'endpoint',
+            'port', 'version', 'path', 'directory', 'dir',
+            'username', 'password', 'token', 'api_key', 'secret',
+            'default_browser', 'theme', 'language', 'os',
+            'model', 'backend', 'engine', 'database',
+        }
+
+        def _extract_entities_and_values(text):
+            triples = []
+            for m in re.finditer(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', text):
+                ip = m.group(1)
+                before = text[:m.start()]
+                entity = _find_entity(before)
+                if entity:
+                    triples.append((entity.lower(), 'ip', ip))
+            for m in re.finditer(r'\bport\s*(\d{2,5})\b', text, re.I):
+                port = m.group(1)
+                before = text[:m.start()]
+                entity = _find_entity(before)
+                if entity:
+                    triples.append((entity.lower(), 'port', port))
+            for m in re.finditer(r'(?:version|v)\s*[:=]?\s*(\d+\.\d+(?:\.\d+)?)', text, re.I):
+                ver = m.group(1)
+                before = text[:m.start()]
+                entity = _find_entity(before)
+                if entity:
+                    triples.append((entity.lower(), 'version', ver))
+            for m in re.finditer(r'(https?://\S+)', text):
+                url = m.group(1).rstrip('.,')
+                before = text[:m.start()]
+                entity = _find_entity(before)
+                if entity:
+                    triples.append((entity.lower(), 'url', url))
+            return triples
+
+        def _find_entity(before_text):
+            known_services = {
+                'sglang', 'qdrant', 'python', 'node', 'nginx', 'redis',
+                'postgres', 'mysql', 'mongodb', 'kafka', 'docker',
+                'mem0', 'hermes', 'cloakbrowser', 'comfyui', 'vllm',
+                'sillytavern', 'whisper', 'transformers', 'torch',
+            }
+            before_lower = before_text.lower()[-80:]
+            for svc in known_services:
+                if svc in before_lower:
+                    return svc
+            words = before_text[-60:].split()
+            for w in reversed(words):
+                clean = re.sub(r'[^\w]', '', w)
+                if len(clean) >= 2 and (clean[0].isupper() or len(clean) >= 4):
+                    return clean.lower()
+            return None
+
+        def _is_config_conflict(text_a, text_b):
+            triples_a = _extract_entities_and_values(text_a)
+            triples_b = _extract_entities_and_values(text_b)
+            if triples_a and triples_b:
+                map_a = {(e, t): v for e, t, v in triples_a}
+                map_b = {(e, t): v for e, t, v in triples_b}
+                for key in set(map_a.keys()) & set(map_b.keys()):
+                    entity, vtype = key
+                    if vtype in _EXCLUSIVE_KEYS and map_a[key] != map_b[key]:
+                        return True
+            ip_a = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', text_a)
+            ip_b = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', text_b)
+            if ip_a and ip_b and set(ip_a) != set(ip_b):
+                return True
+            port_a = re.findall(r'\bport\s*(\d+)\b', text_a, re.I)
+            port_b = re.findall(r'\bport\s*(\d+)\b', text_b, re.I)
+            if port_a and port_b and set(port_a) != set(port_b):
+                return True
+            ver_a = re.findall(r'(?:v|version\s*)?(\d+\.\d+(?:\.\d+)?)', text_a, re.I)
+            ver_b = re.findall(r'(?:v|version\s*)?(\d+\.\d+(?:\.\d+)?)', text_b, re.I)
+            if ver_a and ver_b and set(ver_a) != set(ver_b):
+                return True
+            return False
 
         if has_vectors:
-            # --- Embedding cosine similarity path (primary) ---
-            # Thresholds based on bge-large-zh-v1.5实测:
-            #   > 0.97: exact dedup (only truly identical memories)
-            #   0.80 - 0.97: high-priority conflict marker
-            #   < 0.80: normal injection
-
             for mem in results:
-                mid = mem.get("id", "")
-                mtext = mem.get("memory", "")
-                mvec = mem.get("_embedding")
+                mem_id = mem.get('id', '')
+                mem_text = mem.get('memory', '')
+                mem_vec = mem.get('_embedding')
 
-                is_dup = False
+                is_duplicate = False
                 conflict_with = None
                 max_sim = 0.0
+                conflict_level = None
 
-                for km in kept:
-                    kvec = km.get("_embedding")
-                    if kvec and mvec:
-                        s = cosine_similarity(mvec, kvec)
+                for kept_mem in kept:
+                    kvec = kept_mem.get('_embedding')
+                    if kvec and mem_vec:
+                        cos_sim = cosine_similarity(mem_vec, kvec)
                     else:
-                        # One side missing vector — skip this comparison
                         continue
 
-                    if s > 0.97:
-                        if is_exact_dup(mtext, km.get("memory", "")):
-                            shadow_ids.append(mid)
-                            is_dup = True
-                            break
-                        # High similarity but text differs — treat as conflict
-                        elif s > max_sim:
-                            conflict_with = km
-                            max_sim = s
-                    elif s > 0.80 and s > max_sim:
-                        conflict_with = km
-                        max_sim = s
+                    logger.info("SIM: %.3f vs thresholds (0.97/0.92/0.75)", cos_sim)
 
-                if not is_dup:
+                    if cos_sim > 0.97:
+                        if is_exact_duplicate(mem_text, kept_mem.get('memory', '')):
+                            shadow_ids.append(mem_id)
+                            is_duplicate = True
+                            break
+                        else:
+                            if cos_sim > max_sim:
+                                conflict_with = kept_mem
+                                max_sim = cos_sim
+                                conflict_level = 'high'
+                    elif cos_sim > 0.92 and cos_sim > max_sim:
+                        conflict_with = kept_mem
+                        max_sim = cos_sim
+                        conflict_level = 'high'
+                    elif cos_sim > 0.75 and cos_sim > max_sim:
+                        is_cc = _is_config_conflict(mem_text, kept_mem.get('memory', ''))
+                        logger.info("Conflict check: sim=%.3f, config_conflict=%s -> level=%s",
+                                   cos_sim, is_cc, 'high' if is_cc else 'medium')
+                        if is_cc:
+                            conflict_with = kept_mem
+                            max_sim = cos_sim
+                            conflict_level = 'high'
+                        else:
+                            conflict_with = kept_mem
+                            max_sim = cos_sim
+                            conflict_level = 'medium'
+
+                if not is_duplicate:
                     kept.append(mem)
                     if conflict_with is not None:
-                        conflicts.append((mem, conflict_with, max_sim))
+                        logger.info("[DEDUP] Conflict: '%s' vs '%s' sim=%.3f level=%s",
+                                   mem_text[:30], conflict_with.get('memory', '')[:30],
+                                   max_sim, conflict_level)
+                        conflicts.append((mem, conflict_with, max_sim, conflict_level))
         else:
-            # --- Fallback: exact text dedup only, NO conflict markers ---
-            # When embeddings are unavailable, difflib produces too many false positives.
-            # Safe fallback: only merge exact duplicates, never mark conflicts.
             seen_texts = set()
             for mem in results:
                 mid = mem.get("id", "")
@@ -345,15 +441,80 @@ class Mem0MemoryProvider(MemoryProvider):
                     seen_texts.add(clean)
                     kept.append(mem)
 
+        # Track winners / freeze losers
+        if mem0_python and mem0_server:
+            logger.info("[DEDUP] Track/freeze mode enabled")
+            def _decide_winner(mem_a, mem_b):
+                def _parse_dt(s):
+                    try:
+                        dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt
+                    except Exception:
+                        return datetime.min.replace(tzinfo=timezone.utc)
+                dt_a = _parse_dt(mem_a.get('updated_at', ''))
+                dt_b = _parse_dt(mem_b.get('updated_at', ''))
+                if dt_a > dt_b:
+                    return mem_a
+                elif dt_b > dt_a:
+                    return mem_b
+                else:
+                    ac_a = (mem_a.get('metadata') or {}).get('access_count', 0)
+                    ac_b = (mem_b.get('metadata') or {}).get('access_count', 0)
+                    return mem_a if ac_a >= ac_b else mem_b
+
+            def _in_grace_period(mem):
+                try:
+                    created = datetime.fromisoformat(mem.get('created_at', '').replace('Z', '+00:00'))
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    return (datetime.now(timezone.utc) - created).days < 14
+                except Exception:
+                    return False
+
+            loser_ids = set()
+            for c_mem, c_with, c_sim, c_level in conflicts:
+                logger.info("[DEDUP] Processing conflict: level=%s sim=%.3f", c_level, c_sim)
+                if c_level != 'high':
+                    logger.info("[DEDUP] -> Skipping (medium)")
+                    continue
+                if _in_grace_period(c_mem) or _in_grace_period(c_with):
+                    logger.info("[DEDUP] -> Skipping (grace period)")
+                    continue
+                winner = _decide_winner(c_mem, c_with)
+                loser_id = c_with.get('id') if winner is c_mem else c_mem.get('id')
+                loser_ids.add(loser_id)
+                logger.info("[DEDUP] -> Loser: %s", loser_id)
+
+            track_ids = [m.get('id', '') for m in kept if m.get('id') not in loser_ids]
+            if track_ids:
+                try:
+                    subprocess.run(
+                        [mem0_python, mem0_server, "track", json.dumps(track_ids)],
+                        capture_output=True, text=True, timeout=10
+                    )
+                except Exception as e:
+                    logger.debug("Track failed: %s", e)
+
+            if loser_ids:
+                try:
+                    subprocess.run(
+                        [mem0_python, mem0_server, "set_frozen", json.dumps(list(loser_ids))],
+                        capture_output=True, text=True, timeout=10
+                    )
+                except Exception as e:
+                    logger.debug("Set frozen failed: %s", e)
+
         final = kept[:top_k]
         lines = []
         for i, mem in enumerate(final):
             ci = None
-            for cm, cw, cs in conflicts:
+            for cm, cw, cs, cl in conflicts:
                 if cm.get("id") == mem.get("id"):
                     for j, km in enumerate(final):
                         if km.get("id") == cw.get("id"):
-                            ci = (j + 1, cs)
+                            ci = (j + 1, cs, cl)
                             break
             lines.append(fmt_mem(mem, ci))
 
@@ -446,14 +607,10 @@ class Mem0MemoryProvider(MemoryProvider):
                 top_k_fetch = 20
                 top_k_inject = 5
                 
-                # Get paths from config — must be set in mem0.json for local mode
+                # Get paths from config (with local defaults)
                 cfg = _load_config()
-                MEM0_SERVER = cfg.get("mem0_server", "")
-                MEM0_PYTHON = cfg.get("mem0_python", "")
-                
-                if not MEM0_SERVER or not MEM0_PYTHON:
-                    logger.warning("MEM0_SERVER and MEM0_PYTHON must be configured in mem0.json for local mode")
-                    return
+                MEM0_SERVER = cfg.get("mem0_server", "/media/data/mem0/mem0_server.py")
+                MEM0_PYTHON = cfg.get("mem0_python", "/media/data/mem0/.venv/bin/python")
 
                 def run_with_retry(cmd, timeout=30, max_retries=3):
                     """Run subprocess with exponential backoff retry."""
@@ -492,356 +649,22 @@ class Mem0MemoryProvider(MemoryProvider):
                 
                 if not results:
                     return
-                
-                # Step 2: Dual-threshold deduplication using embedding cosine similarity
-                # Thresholds based on bge-large-zh-v1.5实测:
-                #   > 0.97 + exact text match: discard (pure redundant), add to shadow_ids
-                #   > 0.97 + text differs: downgrade to conflict retention
-                #   0.80 < cosine <= 0.97: retain + mark conflict
-                #   <= 0.80: normal injection
-                # Fallback: if no embeddings, do exact text dedup only (no conflict markers)
 
-                def cosine_similarity(a, b):
-                    """Compute cosine similarity between two vectors."""
-                    dot = sum(x * y for x, y in zip(a, b))
-                    norm_a = sum(x * x for x in a) ** 0.5
-                    norm_b = sum(x * x for x in b) ** 0.5
-                    if norm_a < 1e-9 or norm_b < 1e-9:
-                        return 0.0
-                    return dot / (norm_a * norm_b)
+                # Apply shared deduplication + conflict detection + track freezing
+                cfg = _load_config()
+                MEM0_SERVER = cfg.get("mem0_server", "/media/data/mem0/mem0_server.py")
+                MEM0_PYTHON = cfg.get("mem0_python", "/media/data/mem0/.venv/bin/python")
 
-                def is_exact_duplicate(text1, text2):
-                    """Check if texts are identical after removing punctuation and spaces."""
-                    clean1 = re.sub(r'[^\w\s]', '', text1).strip()
-                    clean2 = re.sub(r'[^\w\s]', '', text2).strip()
-                    return clean1 == clean2
+                top_k_inject = 5
+                lines, kept_ids, shadow_ids = self._advanced_dedup_and_format(
+                    results, top_k_inject,
+                    mem0_python=MEM0_PYTHON,
+                    mem0_server=MEM0_SERVER,
+                )
 
-                has_vectors = any("_embedding" in r and r["_embedding"] for r in results)
-
-                kept = []           # Memories to inject
-                shadow_ids = []     # Pure redundant memories (for touch only)
-                conflicts = []      # Conflict pairs: (mem, conflict_with_mem, similarity)
-
-                # Dual-level conflict detection:
-                #   > 0.92: high-confidence conflict (⚠️) — only track winner
-                #   0.75-0.92: possible related (🔗) — both track normally
-                #   < 0.75: unrelated — normal injection
-                # Config-type conflicts (IP/port/version) in 0.85-0.92 are promoted to high-confidence.
-
-                # --- Entity alignment + whitelist conflict detection ---
-                # Mutually exclusive keys: only these config attributes are single-value
-                _EXCLUSIVE_KEYS = {
-                    'ip', 'host', 'hostname', 'address', 'url', 'endpoint',
-                    'port', 'version', 'path', 'directory', 'dir',
-                    'username', 'password', 'token', 'api_key', 'secret',
-                    'default_browser', 'theme', 'language', 'os',
-                    'model', 'backend', 'engine', 'database',
-                }
-
-                def _extract_entities_and_values(text):
-                    """Extract (entity_name, value_type, value) triples from memory text.
-
-                    Returns a list of tuples like:
-                    [('sglang', 'ip', '127.0.0.1'), ('python', 'version', '3.12')]
-
-                    Design: entity-name + value-type alignment (not verb templates).
-                    This is robust against language variation (e.g. "is accessible at" vs "uses ... for").
-                    """
-                    triples = []
-                    # IP addresses
-                    for m in re.finditer(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', text):
-                        ip = m.group(1)
-                        # Try to find the entity name before the IP
-                        before = text[:m.start()]
-                        entity = _find_entity(before)
-                        if entity:
-                            triples.append((entity.lower(), 'ip', ip))
-                    # Port numbers (avoid timestamps: require "port" keyword or URL context)
-                    for m in re.finditer(r'\bport\s*(\d{2,5})\b', text, re.I):
-                        port = m.group(1)
-                        before = text[:m.start()]
-                        entity = _find_entity(before)
-                        if entity:
-                            triples.append((entity.lower(), 'port', port))
-                    # Version numbers (require "version" or "v" prefix to avoid false positives)
-                    for m in re.finditer(r'(?:version|v)\s*[:=]?\s*(\d+\.\d+(?:\.\d+)?)', text, re.I):
-                        ver = m.group(1)
-                        before = text[:m.start()]
-                        entity = _find_entity(before)
-                        if entity:
-                            triples.append((entity.lower(), 'version', ver))
-                    # URLs
-                    for m in re.finditer(r'(https?://\S+)', text):
-                        url = m.group(1).rstrip('.,')
-                        before = text[:m.start()]
-                        entity = _find_entity(before)
-                        if entity:
-                            triples.append((entity.lower(), 'url', url))
-                    return triples
-
-                def _find_entity(before_text):
-                    """Find the entity/service name in the text preceding a value.
-
-                    Looks for known service names or capitalized nouns within ~60 chars.
-                    Returns the entity name or None.
-                    """
-                    # Known service names (case-insensitive match)
-                    known_services = {
-                        'sglang', 'qdrant', 'python', 'node', 'nginx', 'redis',
-                        'postgres', 'mysql', 'mongodb', 'kafka', 'docker',
-                        'mem0', 'hermes', 'cloackbrowser', 'comfyui', 'vllm',
-                        'sillytavern', 'whisper', 'transformers', 'torch',
-                    }
-                    before_lower = before_text.lower()[-80:]  # last 80 chars
-                    for svc in known_services:
-                        if svc in before_lower:
-                            return svc
-                    # Fallback: find capitalized word(s) near the end
-                    words = before_text[-60:].split()
-                    for w in reversed(words):
-                        clean = re.sub(r'[^\w]', '', w)
-                        if len(clean) >= 2 and (clean[0].isupper() or len(clean) >= 4):
-                            return clean.lower()
-                    return None
-
-                def _is_config_conflict(text_a, text_b):
-                    """Check if two memories have same-entity-same-type-different-value conflicts.
-
-                    Uses entity alignment + exclusive keys whitelist.
-                    Falls back to original entity comparison if extraction fails.
-                    """
-                    # Primary: entity + value type alignment
-                    triples_a = _extract_entities_and_values(text_a)
-                    triples_b = _extract_entities_and_values(text_b)
-
-                    if triples_a and triples_b:
-                        # Build lookup: (entity, type) -> value
-                        map_a = {(e, t): v for e, t, v in triples_a}
-                        map_b = {(e, t): v for e, t, v in triples_b}
-
-                        for key in set(map_a.keys()) & set(map_b.keys()):
-                            entity, vtype = key
-                            if vtype in _EXCLUSIVE_KEYS and map_a[key] != map_b[key]:
-                                return True
-
-                    # Fallback: original entity comparison (for cases extraction misses)
-                    ip_a = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', text_a)
-                    ip_b = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', text_b)
-                    if ip_a and ip_b and set(ip_a) != set(ip_b):
-                        return True
-
-                    port_a = re.findall(r'\bport\s*(\d+)\b', text_a, re.I)
-                    port_b = re.findall(r'\bport\s*(\d+)\b', text_b, re.I)
-                    if port_a and port_b and set(port_a) != set(port_b):
-                        return True
-
-                    ver_a = re.findall(r'(?:v|version\s*)?(\d+\.\d+(?:\.\d+)?)', text_a, re.I)
-                    ver_b = re.findall(r'(?:v|version\s*)?(\d+\.\d+(?:\.\d+)?)', text_b, re.I)
-                    if ver_a and ver_b and set(ver_a) != set(ver_b):
-                        return True
-
-                    return False
-
-                if has_vectors:
-                    # Embedding cosine similarity path (primary)
-                    for mem in results:
-                        mem_id = mem.get('id', '')
-                        mem_text = mem.get('memory', '')
-                        mem_vec = mem.get('_embedding')
-
-                        is_duplicate = False
-                        conflict_with = None
-                        max_sim = 0.0
-                        conflict_level = None  # 'high' or 'medium'
-
-                        for kept_mem in kept:
-                            kvec = kept_mem.get('_embedding')
-                            if kvec and mem_vec:
-                                cos_sim = cosine_similarity(mem_vec, kvec)
-                            else:
-                                continue
-
-                            if cos_sim > 0.97:
-                                if is_exact_duplicate(mem_text, kept_mem.get('memory', '')):
-                                    shadow_ids.append(mem_id)
-                                    is_duplicate = True
-                                    break
-                                else:
-                                    # High-confidence conflict (>0.97)
-                                    if cos_sim > max_sim:
-                                        conflict_with = kept_mem
-                                        max_sim = cos_sim
-                                        conflict_level = 'high'
-                            elif cos_sim > 0.92 and cos_sim > max_sim:
-                                # High-confidence conflict (0.92-0.97)
-                                conflict_with = kept_mem
-                                max_sim = cos_sim
-                                conflict_level = 'high'
-                            elif cos_sim > 0.75 and cos_sim > max_sim:
-                                # Check if config-type conflict (promote to high-confidence)
-                                # Threshold lowered from 0.85 to 0.75 to catch detail-level conflicts
-                                if _is_config_conflict(mem_text, kept_mem.get('memory', '')):
-                                    conflict_with = kept_mem
-                                    max_sim = cos_sim
-                                    conflict_level = 'high'
-                                else:
-                                    # Medium-confidence (possible related)
-                                    conflict_with = kept_mem
-                                    max_sim = cos_sim
-                                    conflict_level = 'medium'
-                            elif cos_sim > 0.75 and cos_sim > max_sim:
-                                # Medium-confidence (possible related)
-                                conflict_with = kept_mem
-                                max_sim = cos_sim
-                                conflict_level = 'medium'
-
-                        if not is_duplicate:
-                            kept.append(mem)
-                            if conflict_with is not None:
-                                conflicts.append((mem, conflict_with, max_sim, conflict_level))
-                else:
-                    # Fallback: exact text dedup only, NO conflict markers
-                    seen_texts = set()
-                    for mem in results:
-                        mem_id = mem.get('id', '')
-                        mem_text = mem.get('memory', '')
-                        clean = re.sub(r'[^\w\s]', '', mem_text).strip().lower()
-                        if clean in seen_texts:
-                            shadow_ids.append(mem_id)
-                        else:
-                            seen_texts.add(clean)
-                            kept.append(mem)
-                
-                # Step 3: Track only winners (losers are frozen — natural decay)
-                if kept or shadow_ids:
-                    def _decide_winner(mem_a, mem_b):
-                        """Conflict resolution: newer updated_at wins, tie-break by access_count."""
-                        def _parse_dt(s):
-                            try:
-                                dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
-                                if dt.tzinfo is None:
-                                    dt = dt.replace(tzinfo=timezone.utc)
-                                return dt
-                            except Exception:
-                                return datetime.min.replace(tzinfo=timezone.utc)
-                        
-                        dt_a = _parse_dt(mem_a.get('updated_at', ''))
-                        dt_b = _parse_dt(mem_b.get('updated_at', ''))
-                        if dt_a > dt_b:
-                            return mem_a
-                        elif dt_b > dt_a:
-                            return mem_b
-                        else:
-                            ac_a = (mem_a.get('metadata') or {}).get('access_count', 0)
-                            ac_b = (mem_b.get('metadata') or {}).get('access_count', 0)
-                            return mem_a if ac_a >= ac_b else mem_b
-                    
-                    # Grace period check: skip conflict resolution if either side is new
-                    def _in_grace_period(mem):
-                        try:
-                            created = datetime.fromisoformat(mem.get('created_at', '').replace('Z', '+00:00'))
-                            if created.tzinfo is None:
-                                created = created.replace(tzinfo=timezone.utc)
-                            return (datetime.now(timezone.utc) - created).days < 14
-                        except Exception:
-                            return False
-
-                    # Determine loser IDs from HIGH-CONFIDENCE conflict pairs only.
-                    # Medium-confidence (🔗) conflicts: both track normally.
-                    loser_ids = set()
-                    for c_mem, c_with, c_sim, c_level in conflicts:
-                        if c_level != 'high':
-                            continue  # Medium-confidence: both track normally
-                        # Grace period exemption: both track normally
-                        if _in_grace_period(c_mem) or _in_grace_period(c_with):
-                            continue
-                        winner = _decide_winner(c_mem, c_with)
-                        loser_id = c_with.get('id') if winner is c_mem else c_mem.get('id')
-                        loser_ids.add(loser_id)
-                    
-                    # Track only winners (kept minus losers)
-                    track_ids = [m.get('id', '') for m in kept if m.get('id') not in loser_ids]
-                    if track_ids:
-                        run_with_retry(
-                            [
-                                MEM0_PYTHON, MEM0_SERVER,
-                                "track", json.dumps(track_ids)
-                            ],
-                            timeout=10
-                        )
-
-                    # Set track_frozen=True for losers — prevents anchor compensation resurrection.
-                    if loser_ids:
-                        run_with_retry(
-                            [
-                                MEM0_PYTHON, MEM0_SERVER,
-                                "set_frozen", json.dumps(list(loser_ids))
-                            ],
-                            timeout=10
-                        )
-
-                    # Shadow memories (exact duplicates) are NOT touched — let them decay naturally.
-                    # Previously they were touched to update last_accessed_at, which caused immortal zombies.
-                
-                # Step 4: Format memories with frequency labels and conflict markers
-                from datetime import datetime, timezone
-                
-                def get_frequency_label(access_count):
-                    if access_count > 20:
-                        return "高频"
-                    elif access_count >= 5:
-                        return "中频"
-                    else:
-                        return "低频"
-                
-                def format_memory(mem, conflict_info=None):
-                    now = datetime.now(timezone.utc)
-                    updated_str = mem.get('updated_at', '')
-                    days_ago = 0
-                    if updated_str:
-                        try:
-                            updated = datetime.fromisoformat(updated_str.replace('Z', '+00:00'))
-                            if updated.tzinfo is None:
-                                updated = updated.replace(tzinfo=timezone.utc)
-                            days_ago = max(0, (now - updated).days)
-                        except Exception:
-                            pass
-                    
-                    # Access count is in metadata field
-                    metadata = mem.get('metadata', {}) or {}
-                    access_count = metadata.get('access_count', 0)
-                    freq = get_frequency_label(access_count)
-                    
-                    prefix = f"[Updated {days_ago} days ago | {datetime.now(timezone.utc).strftime('%Y-%m-%d')} | {freq}]"
-                    
-                    if conflict_info:
-                        target_index, sim, level = conflict_info
-                        if level == 'high':
-                            note = f" ⚠️ 可能与第{target_index}条冲突(相似度{sim:.2f})"
-                        else:
-                            note = f" 🔗 可能与第{target_index}条相关(相似度{sim:.2f}，可能描述同一事物的不同状态)"
-                        return f"- {prefix}{note}：{mem.get('memory', '')}"
-                    else:
-                        return f"- {prefix} {mem.get('memory', '')}"
-                
-                # Build final output (top 5 after deduplication)
-                final_kept = kept[:top_k_inject]
-                lines = []
-                for i, mem in enumerate(final_kept):
-                    # Check if this memory has a conflict
-                    conflict_info = None
-                    for c_mem, c_with, c_sim, c_level in conflicts:
-                        if c_mem.get('id') == mem.get('id'):
-                            # Find the index of the conflict target
-                            for j, k_mem in enumerate(final_kept):
-                                if k_mem.get('id') == c_with.get('id'):
-                                    conflict_info = (j + 1, c_sim, c_level)
-                                    break
-                    
-                    lines.append(format_memory(mem, conflict_info))
-                
                 with self._prefetch_lock:
                     self._prefetch_result = "\n".join(lines)
+
                 
                 self._record_success()
             except Exception as e:
@@ -912,13 +735,10 @@ class Mem0MemoryProvider(MemoryProvider):
                 # Use subprocess to mem0_server.py for consistent embedding support
                 import subprocess
                 
-                # Get paths from config — must be set in mem0.json for local mode
+                # Get paths from config (with local defaults)
                 cfg = _load_config()
-                MEM0_SERVER = cfg.get("mem0_server", "")
-                MEM0_PYTHON = cfg.get("mem0_python", "")
-                
-                if not MEM0_SERVER or not MEM0_PYTHON:
-                    return tool_error("MEM0_SERVER and MEM0_PYTHON must be configured in mem0.json for local mode")
+                MEM0_SERVER = cfg.get("mem0_server", "/media/data/mem0/mem0_server.py")
+                MEM0_PYTHON = cfg.get("mem0_python", "/media/data/mem0/.venv/bin/python")
 
                 result = subprocess.run(
                     [
@@ -942,7 +762,11 @@ class Mem0MemoryProvider(MemoryProvider):
                 # DEBUG: log vector status
                 vec_count = sum(1 for r in results if isinstance(r.get("_embedding"), list))
                 logger.info("mem0_search: %d results, %d with vectors", len(results), vec_count)
-                lines, kept_ids, shadow_ids = self._deduplicate_and_format(results, inject_k)
+                lines, kept_ids, shadow_ids = self._advanced_dedup_and_format(
+                    results, inject_k,
+                    mem0_python=MEM0_PYTHON,
+                    mem0_server=MEM0_SERVER,
+                )
                 # DEBUG: log conflict count
                 conflict_count = sum(1 for l in lines if "⚠️" in l)
                 logger.info("mem0_search: %d lines, %d conflicts", len(lines), conflict_count)
