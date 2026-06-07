@@ -20,7 +20,7 @@ hermes memory setup    # select "mem0"
 Or manually:
 ```bash
 hermes config set memory.provider mem0
-echo "MEM0_API_KEY=your-key" >> ~/.hermes/.env
+echo "MEM0_API_KEY=*** >> ~/.hermes/.env
 ```
 
 ### Local Mode (Self-hosted)
@@ -37,7 +37,7 @@ Run Mem0 entirely on your local machine with no external API calls. Uses a local
 
 1. Install dependencies in a dedicated venv:
 ```bash
-cd /media/data/mem0
+cd /path/to/your/mem0/dir
 uv venv --python 3.11
 source .venv/bin/activate
 uv pip install mem0ai qdrant-client sentence-transformers
@@ -52,9 +52,11 @@ docker run -p 6333:6333 qdrant/qdrant
 ```json
 {
   "mode": "local",
+  "mem0_server": "/path/to/your/mem0/dir/mem0_server.py",
+  "mem0_python": "/path/to/your/mem0/dir/.venv/bin/python",
   "llm_base_url": "http://localhost:1234/v1",
   "llm_model": "qwen3",
-  "embedder_model": "/path/to/bge-large-zh-v1.5",
+  "embedder_model": "/path/to/your/bge-large-zh-v1.5",
   "embedding_dims": 1024,
   "qdrant_host": "localhost",
   "qdrant_port": 6333
@@ -63,7 +65,7 @@ docker run -p 6333:6333 qdrant/qdrant
 
 4. Start the custom server:
 ```bash
-cd /media/data/mem0
+cd /path/to/your/mem0/dir
 python3 mem0_server.py search "test query" hermes-user 5 false
 ```
 
@@ -77,12 +79,24 @@ Config file: `$HERMES_HOME/mem0.json`
 | `user_id` | `hermes-user` | User identifier |
 | `agent_id` | `hermes` | Agent identifier |
 | `rerank` | `true` | Enable reranking for recall |
+| `mem0_server` | *(required for local mode)* | Path to mem0_server.py |
+| `mem0_python` | *(required for local mode)* | Path to Python executable in mem0 venv |
 | `llm_base_url` | `http://localhost:1234/v1` | Local LLM endpoint |
 | `llm_model` | `qwen3` | Local LLM model name |
-| `embedder_model` | `/path/to/bge-large-zh-v1.5` | Embedding model path |
+| `embedder_model` | *(required for local mode)* | Embedding model path |
 | `embedding_dims` | `1024` | Embedding dimension |
 | `qdrant_host` | `localhost` | Qdrant host |
 | `qdrant_port` | `6333` | Qdrant port |
+
+**Environment variables** (alternative to mem0.json):
+- `MEM0_SERVER` — path to mem0_server.py
+- `MEM0_PYTHON` — path to Python executable in mem0 venv
+- `LLM_BASE_URL` — local LLM endpoint
+- `LLM_MODEL` — local LLM model name
+- `EMBEDDER_MODEL` — embedding model path
+- `EMBEDDING_DIMS` — embedding dimension
+- `QDRANT_HOST` — Qdrant host
+- `QDRANT_PORT` — Qdrant port
 
 ---
 
@@ -224,7 +238,7 @@ If you see `FutureWarning: get_sentence_embedding_dimension is deprecated`, patc
 
 ```bash
 sed -i 's/get_sentence_embedding_dimension/get_embedding_dimension/g' \
-    /media/data/mem0/.venv/lib/python3.11/site-packages/mem0/embeddings/huggingface.py
+    /path/to/your/mem0/venv/lib/python3.11/site-packages/mem0/embeddings/huggingface.py
 ```
 
 ### Model Loading Warning on Every Call

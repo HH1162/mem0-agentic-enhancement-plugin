@@ -51,6 +51,15 @@ def _load_config() -> dict:
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
         "rerank": True,
         "keyword_search": False,
+        # Local mode paths — configure these in mem0.json or env vars
+        "mem0_server": os.environ.get("MEM0_SERVER", ""),
+        "mem0_python": os.environ.get("MEM0_PYTHON", ""),
+        "llm_base_url": os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1"),
+        "llm_model": os.environ.get("LLM_MODEL", "qwen3"),
+        "embedder_model": os.environ.get("EMBEDDER_MODEL", ""),
+        "embedding_dims": int(os.environ.get("EMBEDDING_DIMS", "1024")),
+        "qdrant_host": os.environ.get("QDRANT_HOST", "localhost"),
+        "qdrant_port": int(os.environ.get("QDRANT_PORT", "6333")),
     }
 
     config_path = get_hermes_home() / "mem0.json"
@@ -188,7 +197,7 @@ class Mem0MemoryProvider(MemoryProvider):
                         'embedder': {
                             'provider': 'huggingface',
                             'config': {
-                                'model': cfg.get("embedder_model", "/home/herocco/bge/bge-large-zh-v1.5")
+                                'model': cfg.get("embedder_model", "")
                             }
                         },
                         'vector_store': {
@@ -437,8 +446,14 @@ class Mem0MemoryProvider(MemoryProvider):
                 top_k_fetch = 20
                 top_k_inject = 5
                 
-                MEM0_SERVER = "/media/data/mem0/mem0_server.py"
-                MEM0_PYTHON = "/media/data/mem0/.venv/bin/python"
+                # Get paths from config — must be set in mem0.json for local mode
+                cfg = _load_config()
+                MEM0_SERVER = cfg.get("mem0_server", "")
+                MEM0_PYTHON = cfg.get("mem0_python", "")
+                
+                if not MEM0_SERVER or not MEM0_PYTHON:
+                    logger.warning("MEM0_SERVER and MEM0_PYTHON must be configured in mem0.json for local mode")
+                    return
 
                 def run_with_retry(cmd, timeout=30, max_retries=3):
                     """Run subprocess with exponential backoff retry."""
@@ -894,15 +909,16 @@ class Mem0MemoryProvider(MemoryProvider):
             rerank = args.get("rerank", False)
             top_k = min(int(args.get("top_k", 10)), 50)
             try:
-                # SIDE EFFECT: Create a file to verify this code path is executed
-                import os
-                with open("/tmp/mem0_search_executed_" + str(os.getpid()), "w") as f:
-                    f.write(f"EXECUTED at {__import__('time').time()}: query={query}\n")
-                
                 # Use subprocess to mem0_server.py for consistent embedding support
                 import subprocess
-                MEM0_SERVER = "/media/data/mem0/mem0_server.py"
-                MEM0_PYTHON = "/media/data/mem0/.venv/bin/python"
+                
+                # Get paths from config — must be set in mem0.json for local mode
+                cfg = _load_config()
+                MEM0_SERVER = cfg.get("mem0_server", "")
+                MEM0_PYTHON = cfg.get("mem0_python", "")
+                
+                if not MEM0_SERVER or not MEM0_PYTHON:
+                    return tool_error("MEM0_SERVER and MEM0_PYTHON must be configured in mem0.json for local mode")
 
                 result = subprocess.run(
                     [
