@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import os
+os.environ.setdefault("HF_HUB_OFFLINE", "1")  # Force offline — no hub checks, use local cache only
+
 """Mem0 memory lifecycle management server — reference implementation.
 
 This script adds access frequency tracking, exponential decay scoring,
@@ -151,7 +154,7 @@ def update_anchor_time():
         pass
 
 
-def compute_weighted_score(access_count, last_accessed_iso, anchor_time=None):
+def compute_weighted_score(access_count, last_accessed_iso, anchor_time=None, track_frozen=False):
     """Exponential decay based on system active time, not physical wall-clock time.
 
     score = min(access_count, CAP) * 0.5^(effective_days / half_life)
@@ -159,6 +162,10 @@ def compute_weighted_score(access_count, last_accessed_iso, anchor_time=None):
     effective_days = max(0, raw_days - time_offset_days)
     where raw_days = (anchor_time - last_accessed_at)
     and time_offset_days is accumulated offline gap (prevents offline snowball decay)
+
+    When track_frozen=True (loser of conflict resolution), time_offset compensation
+    is NOT applied — frozen memories decay naturally without being resurrected by
+    offline gap resets. This prevents the "anchor compensation resurrection" bug.
 
     When anchor_time is None, defaults to current wall-clock time.
     During cleanup/stats, anchor_time is explicitly passed to ensure
@@ -190,10 +197,15 @@ def compute_weighted_score(access_count, last_accessed_iso, anchor_time=None):
 
         raw_days = max(0, (anchor_time - last_dt).total_seconds() / 86400)
 
-        # Subtract accumulated offline gap offset
-        state = _load_state()
-        time_offset = state.get('time_offset_days', 0.0)
-        effective_days = max(0, raw_days - time_offset)
+        # Subtract accumulated offline gap offset — UNLESS track_frozen is True.
+        # Frozen memories (losers of conflict resolution) should decay naturally
+        # without benefiting from offline gap compensation.
+        if not track_frozen:
+            state = _load_state()
+            time_offset = state.get('time_offset_days', 0.0)
+            effective_days = max(0, raw_days - time_offset)
+        else:
+            effective_days = raw_days
 
         return float(min(access_count, ACCESS_COUNT_CAP)) * (0.5 ** (effective_days / HALF_LIFE_DAYS))
     except Exception:
@@ -213,6 +225,7 @@ def get_memory_client():
     import os
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("FASTEMBED_CACHE_PATH", "/home/herocco/bge")
     config = {
         'llm': {
             'provider': 'openai',
@@ -225,7 +238,14 @@ def get_memory_client():
         'embedder': {
             'provider': 'huggingface',
             'config': {
-                'model': 'bge-large-zh-v1.5'  # local path or model name
+                'model': '/home/herocco/bge/bge-large-zh-v1.5'
+            }
+        },
+        'reranker': {
+            'provider': 'huggingface',
+            'config': {
+                'model': '/home/herocco/bge/BAAI/bge-reranker-base',
+                'device': 'cuda'
             }
         },
         'vector_store': {
@@ -261,7 +281,7 @@ def batch_get_access_payload(qdrant, mem_ids):
     """Batch retrieve access payloads for multiple memory IDs.
 
     Replaces N sequential Qdrant queries with a single batch retrieve call.
-    Returns dict: {mem_id: (access_count, last_accessed_at)}
+    Returns dict: {mem_id: (access_count, last_accessed_at, track_frozen)}
 
     This eliminates the N+1 query problem in stats/cleanup/least_used operations.
     Without this, 100 memories = 100 network roundtrips (1-3 seconds).
@@ -281,15 +301,70 @@ def batch_get_access_payload(qdrant, mem_ids):
             payload = p.payload or {}
             result[str(p.id)] = (
                 payload.get('access_count', 0),
-                payload.get('last_accessed_at', 'never')
+                payload.get('last_accessed_at', 'never'),
+                payload.get('track_frozen', False)
             )
         return result
     except Exception as e:
-        # CRITICAL: Never swallow Qdrant errors silently.
-        # If we return {} here, cleanup will see ac=0 for ALL memories
-        # and delete everything past the grace period (Fail-Deadly).
-        # Raising forces the caller to abort (Fail-Safe).
-        raise RuntimeError(f"Qdrant batch retrieve failed for {len(mem_ids)} memories: {e}")
+        raise RuntimeError(f"Qdrant batch_get_access_payload failed: {e}")
+
+
+def scroll_all_memories(qdrant, user_id=None):
+    """Full scan of the 'mem0' collection via Qdrant scroll API.
+
+    Returns list of dicts with keys: id, memory, created_at, user_id,
+    access_count, last_accessed_at, track_frozen.
+
+    Safety guarantees:
+      - Hard-coded collection_name='mem0' — never touches other collections
+      - Optional user_id filter — when None, scans ALL users (hermes-user + wechat)
+      - with_vectors=False — no embedding data fetched, only payload metadata
+
+    Replaces client.get_all() which was limited by top_k=20.
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+    # Build filter: only user_id conditions (no other app's data)
+    must_conditions = []
+    if user_id:
+        must_conditions.append(FieldCondition(key='user_id', match=MatchValue(value=user_id)))
+
+    query_filter = Filter(must=must_conditions) if must_conditions else None
+
+    all_points = []
+    offset = None
+    while True:
+        try:
+            result, offset = qdrant.scroll(
+                collection_name='mem0',
+                scroll_filter=query_filter,
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Qdrant scroll failed: {e}")
+
+        if not result:
+            break
+
+        for pt in result:
+            payload = pt.payload or {}
+            all_points.append({
+                'id': str(pt.id),
+                'memory': payload.get('data', ''),
+                'created_at': payload.get('created_at', ''),
+                'user_id': payload.get('user_id', ''),
+                'access_count': payload.get('access_count', 0),
+                'last_accessed_at': payload.get('last_accessed_at', 'never'),
+                'track_frozen': payload.get('track_frozen', False),
+            })
+
+        if offset is None:
+            break
+
+    return all_points
 
 
 def main():
@@ -311,6 +386,8 @@ def main():
             client = get_memory_client()
 
         if action == "search":
+            import sys as _sys
+            print("### MEM0_SERVER_SEARCH_CALLED ###", file=_sys.stderr)
             query = sys.argv[2]
             user_id = sys.argv[3]
             top_k = int(sys.argv[4]) if len(sys.argv) > 4 else 10
@@ -325,27 +402,56 @@ def main():
                 threshold=0.1
             )
 
+            results_list = results.get('results', []) if isinstance(results, dict) else results
+
             # Track access frequency for each matched memory (unless --no-track)
-            if results and not no_track:
-                results_list = results.get('results', []) if isinstance(results, dict) else results
-                if results_list:
+            if results_list and not no_track:
+                qdrant = QdrantClient(host='localhost', port=6333)
+                now = datetime.now(timezone.utc).isoformat()
+                for r in results_list:
+                    mem_id = str(r.get('id', ''))
+                    if mem_id:
+                        try:
+                            ac, _ = get_access_payload(qdrant, mem_id)
+                            qdrant.set_payload(
+                                collection_name='mem0',
+                                payload={
+                                    'access_count': min(ac + 1, ACCESS_COUNT_CAP),
+                                    'last_accessed_at': now
+                                },
+                                points=[mem_id]
+                            )
+                        except Exception as e:
+                            print(f"Warning: track access failed for {mem_id}: {e}", file=sys.stderr)
+
+            # Fetch embedding vectors from Qdrant for conflict detection (best-effort)
+            if results_list:
+                try:
                     qdrant = QdrantClient(host='localhost', port=6333)
-                    now = datetime.now(timezone.utc).isoformat()
-                    for r in results_list:
-                        mem_id = str(r.get('id', ''))
-                        if mem_id:
-                            try:
-                                ac, _ = get_access_payload(qdrant, mem_id)
-                                qdrant.set_payload(
-                                    collection_name='mem0',
-                                    payload={
-                                        'access_count': min(ac + 1, ACCESS_COUNT_CAP),
-                                        'last_accessed_at': now
-                                    },
-                                    points=[mem_id]
-                                )
-                            except Exception as e:
-                                print(f"Warning: track access failed for {mem_id}: {e}", file=sys.stderr)
+                    mem_ids = [str(r.get('id', '')) for r in results_list if r.get('id')]
+                    if mem_ids:
+                        pts = qdrant.retrieve(
+                            collection_name='mem0',
+                            ids=mem_ids,
+                            with_payload=False,
+                            with_vectors=True
+                        )
+                        vector_map = {}
+                        for p in pts:
+                            vec = p.vector
+                            # Qdrant returns dict with keys: '' (dense) and 'bm25' (sparse)
+                            # Always extract the dense embedding (key='')
+                            if isinstance(vec, dict):
+                                vec = vec.get('', vec.get(list(vec.keys())[0])) if vec else None
+                            if vec is not None:
+                                vector_map[str(p.id)] = vec
+                        # Attach vectors to results
+                        for r in results_list:
+                            rid = str(r.get('id', ''))
+                            if rid in vector_map:
+                                r['_embedding'] = vector_map[rid]
+                except Exception as e:
+                    print(f"Warning: failed to fetch embeddings for conflict detection: {e}", file=sys.stderr)
 
             print(json.dumps(results, default=str))
 
@@ -483,12 +589,8 @@ def main():
             # Use time anchor for consistent scoring (not wall-clock now)
             anchor = get_anchor_time()
 
-            all_mems = client.get_all(filters={'user_id': user_id})
-            results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
-
-            # BATCH retrieve all payloads in one call (eliminates N+1 query problem)
-            mem_ids = [str(m.get('id', '')) for m in results if m.get('id')]
-            payload_map = batch_get_access_payload(qdrant, mem_ids)
+            # Full scan via Qdrant scroll — replaces client.get_all(top_k=20)
+            results = scroll_all_memories(qdrant, user_id=user_id)
 
             total = len(results)
             with_access = 0
@@ -499,8 +601,9 @@ def main():
             max_weighted = 0.0
 
             for m in results:
-                mem_id = str(m.get('id', ''))
-                ac, la = payload_map.get(mem_id, (0, 'never'))
+                ac = m['access_count']
+                la = m['last_accessed_at']
+                tf = m['track_frozen']
                 total_access += ac
                 if ac > 0:
                     with_access += 1
@@ -509,7 +612,7 @@ def main():
                 if ac > max_access:
                     max_access = ac
 
-                w = compute_weighted_score(ac, la, anchor_time=anchor)
+                w = compute_weighted_score(ac, la, anchor_time=anchor, track_frozen=tf)
                 total_weighted += w
                 max_weighted = max(max_weighted, w)
 
@@ -535,35 +638,70 @@ def main():
 
             anchor = get_anchor_time()
 
-            all_mems = client.get_all(filters={'user_id': user_id})
-            results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
-
-            # BATCH retrieve all payloads in one call (eliminates N+1 query problem)
-            mem_ids = [str(m.get('id', '')) for m in results if m.get('id')]
-            payload_map = batch_get_access_payload(qdrant, mem_ids)
+            # Full scan via Qdrant scroll — replaces client.get_all(top_k=20)
+            results = scroll_all_memories(qdrant, user_id=user_id)
 
             with_stats = []
             for m in results:
-                mem_id = str(m.get('id', ''))
-                ac, la = payload_map.get(mem_id, (0, 'never'))
-                w = compute_weighted_score(ac, la, anchor_time=anchor)
+                w = compute_weighted_score(m['access_count'], m['last_accessed_at'],
+                                           anchor_time=anchor, track_frozen=m['track_frozen'])
                 with_stats.append({
-                    'id': mem_id,
-                    'memory': m.get('memory', '')[:120],
-                    'access_count': ac,
-                    'last_accessed_at': la,
+                    'id': m['id'],
+                    'memory': m['memory'][:120],
+                    'access_count': m['access_count'],
+                    'last_accessed_at': m['last_accessed_at'],
                     'weighted_score': round(w, 4),
-                    'created_at': m.get('created_at', '')
+                    'track_frozen': m['track_frozen'],
+                    'created_at': m['created_at']
                 })
 
             with_stats.sort(key=lambda x: x['weighted_score'])
             print(json.dumps(with_stats[:top_n], indent=2))
 
+        elif action == "set_frozen":
+            """Set track_frozen=True for the given memory IDs (losers of conflict resolution).
+
+            Usage: python mem0_server.py set_frozen '["id1", "id2"]'
+
+            This prevents frozen memories from benefiting from offline gap compensation,
+            ensuring they decay naturally without being resurrected by anchor resets.
+            """
+            import json as json_mod
+            try:
+                ids_to_freeze = json_mod.loads(sys.argv[2]) if len(sys.argv) > 2 else []
+            except (json_mod.JSONDecodeError, IndexError):
+                print("Error: invalid JSON array of IDs")
+                sys.exit(1)
+
+            if not ids_to_freeze:
+                print("No IDs to freeze")
+                sys.exit(0)
+
+            qdrant = QdrantClient(host='localhost', port=6333)
+            pts = qdrant.retrieve(
+                collection_name='mem0',
+                ids=[str(mid) for mid in ids_to_freeze],
+                with_payload=True
+            )
+            frozen_count = 0
+            for p in pts:
+                payload = p.payload or {}
+                if not payload.get('track_frozen', False):
+                    payload['track_frozen'] = True
+                    qdrant.set_payload(
+                        collection_name='mem0',
+                        payload=payload,
+                        points=[str(p.id)]
+                    )
+                    frozen_count += 1
+            print(f"Frozen {frozen_count} memories")
+
         elif action == "cleanup":
-            # Parse arguments: cleanup [--dry-run] [--threshold X] [user_id]
+            # Parse arguments: cleanup [--dry-run] [--threshold X] [--all-users | user_id]
             args = sys.argv[2:]
             dry_run = '--dry-run' in args
-            user_id = 'example-user'
+            all_users = '--all-users' in args
+            user_id = None if all_users else 'example-user'
             threshold = CLEANUP_THRESHOLD
 
             skip_next = False
@@ -578,21 +716,17 @@ def main():
                         skip_next = True  # Mark value as consumed so it won't become user_id
                     except ValueError:
                         pass
-                elif not arg.startswith('-'):
+                elif not arg.startswith('-') and not all_users:
                     user_id = arg
 
             qdrant = QdrantClient(host='localhost', port=6333)
 
             anchor = get_anchor_time()
 
-            all_mems = client.get_all(filters={'user_id': user_id})
-            results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
-
-            # BATCH retrieve all payloads in one call (eliminates N+1 query problem)
+            # Full scan via Qdrant scroll — replaces client.get_all(top_k=20)
             # Circuit breaker: if Qdrant is down, abort cleanup entirely (Fail-Safe).
-            mem_ids = [str(m.get('id', '')) for m in results if m.get('id')]
             try:
-                payload_map = batch_get_access_payload(qdrant, mem_ids)
+                results = scroll_all_memories(qdrant, user_id=user_id)
             except RuntimeError as e:
                 print(json.dumps({
                     "error": str(e),
@@ -604,9 +738,8 @@ def main():
             kept = []
 
             for m in results:
-                mem_id = str(m.get('id', ''))
-                ac, la = payload_map.get(mem_id, (0, 'never'))
-                w = compute_weighted_score(ac, la, anchor_time=anchor)
+                w = compute_weighted_score(m['access_count'], m['last_accessed_at'],
+                                           anchor_time=anchor, track_frozen=m['track_frozen'])
 
                 # Grace period: newly created memories (< 14 days old) are protected.
                 # Uses anchor_time as single source of truth instead of datetime.now()
@@ -627,11 +760,12 @@ def main():
                         grace_protected = True
 
                 entry = {
-                    'id': mem_id,
-                    'memory': m.get('memory', '')[:120],
-                    'access_count': ac,
+                    'id': m['id'],
+                    'memory': m['memory'][:120],
+                    'user_id': m['user_id'],
+                    'access_count': m['access_count'],
                     'weighted_score': round(w, 4),
-                    'last_accessed_at': la,
+                    'last_accessed_at': m['last_accessed_at'],
                     'grace_protected': grace_protected
                 }
 
